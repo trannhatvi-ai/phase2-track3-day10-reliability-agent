@@ -15,6 +15,7 @@ class RunMetrics(BaseModel):
     fallback_successes: int = 0
     static_fallbacks: int = 0
     cache_hits: int = 0
+    cache_false_hits: int = 0
     circuit_open_count: int = 0
     recovery_time_ms: float | None = None
     estimated_cost: float = 0.0
@@ -52,6 +53,7 @@ class RunMetrics(BaseModel):
             "latency_p99_ms": round(self.percentile(99), 2),
             "fallback_success_rate": round(self.fallback_success_rate, 4),
             "cache_hit_rate": round(self.cache_hit_rate, 4),
+            "cache_false_hits": self.cache_false_hits,
             "circuit_open_count": self.circuit_open_count,
             "recovery_time_ms": self.recovery_time_ms,
             "estimated_cost": round(self.estimated_cost, 6),

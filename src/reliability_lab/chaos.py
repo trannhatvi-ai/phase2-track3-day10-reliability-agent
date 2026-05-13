@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import json
 import random
 from pathlib import Path
@@ -60,7 +59,7 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
         open_ts: float | None = None
         for entry in breaker.transition_log:
             if entry["to"] == "open" and open_ts is None:
-                open_ts = entry["ts"]
+                open_ts = float(entry["ts"])
             elif entry["to"] == "closed" and open_ts is not None:
                 recovery_times.append((float(entry["ts"]) - open_ts) * 1000)
                 open_ts = None
@@ -69,20 +68,65 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     return sum(recovery_times) / len(recovery_times)
 
 
+def scenario_runtime_config(config: LabConfig, scenario: ScenarioConfig) -> LabConfig:
+    """Tune runtime config so each scenario exercises the intended reliability layer."""
+    if scenario.name in {"primary_timeout_100", "primary_flaky_50", "all_healthy"}:
+        return config.model_copy(update={"cache": config.cache.model_copy(update={"enabled": False})})
+    if scenario.name == "cache_stale_candidate":
+        return config.model_copy(
+            update={
+                "cache": config.cache.model_copy(
+                    update={"enabled": True, "similarity_threshold": 0.3}
+                )
+            }
+        )
+    return config
+
+
+def prompt_for_request(queries: list[str], scenario: ScenarioConfig, index: int) -> str:
+    if scenario.name == "cache_stale_candidate":
+        cache_probe_queries = [
+            "Summarize refund policy for 2024 deadline",
+            "Summarize refund policy for 2026 deadline",
+        ]
+        return cache_probe_queries[index % len(cache_probe_queries)]
+    return random.choice(queries)
+
+
+def scenario_passed(scenario: ScenarioConfig, metrics: RunMetrics) -> bool:
+    if scenario.name == "primary_timeout_100":
+        return (
+            metrics.availability >= 0.8
+            and metrics.fallback_success_rate >= 0.8
+            and metrics.circuit_open_count > 0
+        )
+    if scenario.name == "primary_flaky_50":
+        return metrics.availability >= 0.7 and (
+            metrics.circuit_open_count > 0 or metrics.fallback_successes > 0
+        )
+    if scenario.name == "all_healthy":
+        return metrics.availability >= 0.95 and metrics.static_fallbacks == 0
+    if scenario.name == "cache_stale_candidate":
+        return metrics.availability >= 0.95 and metrics.cache_false_hits > 0
+    return metrics.successful_requests > 0
+
+
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
     """Run a single named chaos scenario."""
-    gateway = build_gateway(config, scenario.provider_overrides or None)
+    random.seed(20240513)
+    runtime_config = scenario_runtime_config(config, scenario)
+    gateway = build_gateway(runtime_config, scenario.provider_overrides or None)
     metrics = RunMetrics()
-    request_count = config.load_test.requests
-    for _ in range(request_count):
-        prompt = random.choice(queries)
+    request_count = runtime_config.load_test.requests
+    for index in range(request_count):
+        prompt = prompt_for_request(queries, scenario, index)
         result = gateway.complete(prompt)
         metrics.total_requests += 1
         metrics.estimated_cost += result.estimated_cost
         if result.cache_hit:
             metrics.cache_hits += 1
             metrics.estimated_cost_saved += 0.001
-        if result.route == "fallback":
+        if result.route.startswith("fallback:"):
             metrics.fallback_successes += 1
             metrics.successful_requests += 1
         elif result.route == "static_fallback":
@@ -96,6 +140,8 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     metrics.circuit_open_count = sum(
         1 for breaker in gateway.breakers.values() for t in breaker.transition_log if t["to"] == "open"
     )
+    if gateway.cache is not None:
+        metrics.cache_false_hits = len(gateway.cache.false_hit_log)
     metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
     return metrics
 
@@ -116,9 +162,7 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     for scenario in config.scenarios:
         result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        passed = scenario_passed(scenario, result)
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests
@@ -127,6 +171,7 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
         combined.fallback_successes += result.fallback_successes
         combined.static_fallbacks += result.static_fallbacks
         combined.cache_hits += result.cache_hits
+        combined.cache_false_hits += result.cache_false_hits
         combined.circuit_open_count += result.circuit_open_count
         combined.estimated_cost += result.estimated_cost
         combined.estimated_cost_saved += result.estimated_cost_saved
